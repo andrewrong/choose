@@ -9,16 +9,12 @@ import (
 	"time"
 )
 
-func (n *NodeStatus) UpdateTime(now int64) {
-	atomic.StoreInt64(&n.LatestHeartbeatTime, now)
-}
+type runStatus = int64
 
-func (n *NodeStatus) IsHealthy(diff int64) bool {
-	if time.Now().UnixMilli()-n.LatestHeartbeatTime >= diff {
-		return false
-	}
-	return true
-}
+const (
+	STOP runStatus = iota
+	START
+)
 
 type VoterNode struct {
 	voter          Voter                 //自定义选举功能
@@ -34,34 +30,18 @@ type VoterNode struct {
 }
 
 func checkVoter(voter Voter, logger *log.Logger) error {
-	if voter.GetHBFreq() < 0 {
-		logger.Printf("voter heartbeat frequency must greater than 0")
-		return errors.New("voter heartbeat frequency must greater than 0")
-	}
-
-	if voter.GetHBTimeout() < 0 {
-		logger.Printf("voter heartbeat timeout must greater than 0")
-		return errors.New("voter heartbeat timeout must greater than 0")
-	}
-
-	if voter.GetCheckMasterFreq() < 0 {
-		logger.Printf("voter check master frequency must greater than 0")
-		return errors.New("voter check master frequency must greater than 0")
-	}
-
-	if voter.GetCheckMasterTimeout() < 0 {
-		logger.Printf("voter check master timeout must greater than 0")
-		return errors.New("voter check master timeout must greater than 0")
-	}
-
-	if voter.GetElectMasterTimeout() < 0 {
-		logger.Printf("voter elect master timeout must greater than 0")
-		return errors.New("voter check master timeout must greater than 0")
-	}
-
 	if voter.GetUuid() == "" {
 		logger.Printf("voter Uuid is empty")
 		return errors.New("voter Uuid is empty")
+	}
+
+	if voter.GetVoterTimeConf() == nil {
+		logger.Printf("voter time config is nil")
+		return errors.New("voter time config is nil")
+	}
+	err := voter.GetVoterTimeConf().Check()
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -126,15 +106,17 @@ func (v *VoterNode) Stop() {
 
 		for k, task := range v.masterTasks {
 			task.Stop()
-			v.putEvent(NewEvent(RUN_MASTER_TASK, fmt.Sprintf("task:%s is stopped, because voterNode is stopped", k)))
+			v.putEvent(NewEvent(VOTER_MASTER_TASK, false, fmt.Sprintf("task:%s is stopped, because voterNode is stopped", k)))
 		}
 		close(v.eventQueue)
+	} else {
+		v.log.Printf("this node has stopped")
 	}
 }
 
 // 当前node是否健康
 func (v *VoterNode) IsHealthy() bool {
-	return v.selfNodeStatus.IsHealthy(int64(v.voter.GetCheckMasterFreq()))
+	return v.selfNodeStatus.IsHealthy(v.voter.GetVoterTimeConf().CheckMasterFreq.Milliseconds())
 }
 
 // 当前节点的心跳时间
@@ -173,7 +155,7 @@ func (v *VoterNode) heartbeat() {
 	v.log.Printf("heartbeat task is running")
 
 	go func() {
-		ticker := time.NewTicker(time.Duration(v.voter.GetHBFreq()) * time.Millisecond)
+		ticker := time.NewTicker(v.voter.GetVoterTimeConf().HBFreq)
 		defer func() {
 			ticker.Stop()
 		}()
@@ -184,7 +166,7 @@ func (v *VoterNode) heartbeat() {
 				{
 					res, t := v.voter.Heartbeat()
 					if !res {
-						v.putEvent(NewEvent(HB, "heartbeat is error"))
+						v.putEvent(NewEvent(VOTER_HB, false, "heartbeat is error"))
 					} else {
 						v.selfNodeStatus.UpdateTime(t)
 					}
@@ -203,7 +185,7 @@ func (v *VoterNode) checkMaster() {
 	v.log.Printf("check master task is running")
 
 	go func() {
-		ticker := time.NewTicker(time.Duration(v.voter.GetCheckMasterFreq()) * time.Millisecond)
+		ticker := time.NewTicker(v.voter.GetVoterTimeConf().CheckMasterFreq)
 		defer func() {
 			ticker.Stop()
 		}()
@@ -215,7 +197,7 @@ func (v *VoterNode) checkMaster() {
 					masterInfo := &NodeStatus{}
 					info, err := v.voter.GetMasterInfo()
 					if err != nil {
-						v.putEvent(NewEvent(GET_MASTER_FAILURE, err.Error()))
+						v.putEvent(NewEvent(VOTER_GET_MASTER, false, err.Error()))
 						if v.masterNodeStatus.Check() {
 							masterInfo = v.masterNodeStatus
 						}
@@ -224,15 +206,15 @@ func (v *VoterNode) checkMaster() {
 					}
 
 					if masterInfo.Check() {
-						if masterInfo.IsHealthy(int64(v.voter.GetCheckMasterFreq())) {
-							v.putEvent(NewEvent(CHECK_MASTER_SUCCESS, "check master is success"))
+						if masterInfo.IsHealthy(v.voter.GetVoterTimeConf().CheckMasterFreq.Milliseconds()) {
+							v.putEvent(NewEvent(VOTER_CHECK_MASTER, true, "check master is success"))
 							v.masterNodeStatus = masterInfo
 							continue
 						}
 
-						v.putEvent(NewEvent(CHECK_MASTER_FAILURE, "check master is error"))
+						v.putEvent(NewEvent(VOTER_CHECK_MASTER, false, "check master is error"))
 						//如果检测check失败的话就需要进行选举
-						if !v.selfNodeStatus.IsHealthy(int64(v.voter.GetCheckMasterFreq())) {
+						if !v.selfNodeStatus.IsHealthy(v.voter.GetVoterTimeConf().CheckMasterFreq.Milliseconds()) {
 							continue
 						}
 					}
@@ -261,20 +243,20 @@ func (v *VoterNode) oneElectMaster() {
 	}()
 
 	if err != nil {
-		v.putEvent(NewEvent(ELECT_MASTER_FAILURE, err.Error()))
+		v.putEvent(NewEvent(VOTER_ELECT_MASTER, false, err.Error()))
 	} else {
-		v.putEvent(NewEvent(ELECT_MASTER_SUCCESS, res))
+		v.putEvent(NewEvent(VOTER_ELECT_MASTER, true, res))
 
 		if res.Uuid == v.selfNodeStatus.Uuid {
 			for key, task := range v.masterTasks {
-				v.putEvent(NewEvent(RUN_MASTER_TASK, fmt.Sprintf("task:%s is running", key)))
+				v.putEvent(NewEvent(VOTER_MASTER_TASK, true, fmt.Sprintf("task:%s is running", key)))
 				task.Start()
 			}
 			return
 		}
 
 		for key, task := range v.masterTasks {
-			v.putEvent(NewEvent(RUN_MASTER_TASK, fmt.Sprintf("task:%s is stop", key)))
+			v.putEvent(NewEvent(VOTER_MASTER_TASK, false, fmt.Sprintf("task:%s is stop", key)))
 			task.Stop()
 		}
 	}

@@ -19,26 +19,34 @@ import (
  * 2. master: 用来抢占节点使用；如果需要进行一次选举，就原子的写入数据，如果成功了就表示抢占成功
  */
 
+// TODO session出现错误之后需要重新刷新;
+
 type MongoVoterImpl struct {
-	host    string
-	db      string
-	hbC     string
-	masterC string
-	uuid    string
-	session *mgo.Session
+	host      string
+	db        string
+	hbC       string
+	masterC   string
+	uuid      string
+	session   *mgo.Session
+	voterConf *core.VoterTimeConfig //选举需要使用到的超时配置
 }
 
-func NewMongoVoterImpl(host, db, hbC, masterC, uuid string) (core.Voter, error) {
-	if db == "" || hbC == "" || masterC == "" || uuid == "" || host == "" {
+func NewMongoVoterImpl(host, db, hbC, masterC, uuid string, voterConf *core.VoterTimeConfig) (core.Voter, error) {
+	if db == "" || hbC == "" || masterC == "" || uuid == "" || host == "" || voterConf == nil {
 		return nil, core.ParamError
 	}
 
+	if err := voterConf.Check(); err != nil {
+		return nil, err
+	}
+
 	tmp := &MongoVoterImpl{
-		host:    host,
-		db:      db,
-		masterC: masterC,
-		hbC:     hbC,
-		uuid:    uuid,
+		host:      host,
+		db:        db,
+		masterC:   masterC,
+		hbC:       hbC,
+		uuid:      uuid,
+		voterConf: voterConf,
 	}
 
 	sess, err := mgo.Dial(host)
@@ -63,12 +71,8 @@ func (m *MongoVoterImpl) Heartbeat() (bool, int64) {
 	return true, now
 }
 
-func (m *MongoVoterImpl) GetHBFreq() int {
-	return 1000
-}
-
-func (m *MongoVoterImpl) GetHBTimeout() time.Duration {
-	return 500 * time.Millisecond
+func (m *MongoVoterImpl) GetVoterTimeConf() *core.VoterTimeConfig {
+	return m.voterConf
 }
 
 func (m *MongoVoterImpl) GetMasterInfo() (*core.NodeStatus, error) {
@@ -79,14 +83,6 @@ func (m *MongoVoterImpl) GetMasterInfo() (*core.NodeStatus, error) {
 	}
 
 	return item, nil
-}
-
-func (m *MongoVoterImpl) GetCheckMasterFreq() int {
-	return 5000
-}
-
-func (m *MongoVoterImpl) GetCheckMasterTimeout() time.Duration {
-	return time.Second
 }
 
 func (m *MongoVoterImpl) ElectMaster(master string) (*core.NodeStatus, error) {
@@ -115,10 +111,6 @@ func (m *MongoVoterImpl) ElectMaster(master string) (*core.NodeStatus, error) {
 		}, nil
 	}
 	return m.GetMasterInfo()
-}
-
-func (m *MongoVoterImpl) GetElectMasterTimeout() time.Duration {
-	return time.Second * 2
 }
 
 func (m *MongoVoterImpl) GetUuid() string {
