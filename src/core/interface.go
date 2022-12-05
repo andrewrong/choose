@@ -1,5 +1,9 @@
 package core
 
+import (
+	"time"
+)
+
 type Voter interface {
 	// 指定一次心跳;
 	Heartbeat() (bool, int64)            //发送一次心跳请求
@@ -39,4 +43,17 @@ func NewEvent(t EventType, res bool, data interface{}) *Event {
 		Res:  res,
 		Data: data,
 	}
+}
+
+type LockBackend interface {
+	// 去抢占锁，
+	Preemption(lock *LockInfo, timeoutMs time.Duration) (bool, int64, error)
+	// 去更新租期，
+	UpdateLease(lock *LockInfo, timeoutMs time.Duration) (bool, int64, error)
+	// 释放lock
+	Release(lock *LockInfo, timeoutMs time.Duration) (bool, error)
+	// 查询Lock信息
+	QueryLockInfo(lock *LockInfo, timeoutMs time.Duration) (*LockInfo, error)
+	//关闭backend
+	Close() error
 }

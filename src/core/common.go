@@ -67,4 +67,20 @@ func (v *VoterTimeConfig) Check() error {
 	return nil
 }
 
-var ParamError = errors.New("param is invalid") //参数无效.
+var ParamError = errors.New("param is invalid")    //参数无效.
+var LockExistError = errors.New("lock is existed") //参数无效.
+var LockError = errors.New("lock is failure")      //参数无效.
+
+var LockInfoParamsError = errors.New("lock info is invalid") //
+var ServiceTimeoutError = errors.New("service timeout")
+
+// ////////////////////////////////////////////////////////////////////////////
+var (
+	DEFAULT_LEASE_MS           int64 = 1000 //默认租期是1秒
+	DEFAULT_BACKEND_TIMEOUT_MS int64 = 200  //默认后端执行的时间
+	DEFAULT_CHECK_EXPIRED_MS   int64 = 100  //检查lock过期的时间
+	DEFAULT_RENEW_MS           int64 = 500  //renew lock时间
+	DEFAULT_RETRY_INTERVAL_MS  int64 = 100
+
+	DEFAULT_MAX_RETRY int = 3
+)

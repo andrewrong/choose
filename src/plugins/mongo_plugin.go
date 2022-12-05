@@ -1,118 +1,258 @@
 package plugins
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/globalsign/mgo"
 	"github.com/globalsign/mgo/bson"
+	"github.com/golang/groupcache/singleflight"
 
 	"choose/src/core"
 )
 
-/**
- *大概实现思路:
- * mongo中会有两张表:
- * 1. heartbeat: 心跳表;用来更新各个节点心跳;
- * 2. master: 用来抢占节点使用；如果需要进行一次选举，就原子的写入数据，如果成功了就表示抢占成功
- */
+var defaultSocketTimeout = time.Duration(1) * time.Second
 
-// TODO session出现错误之后需要重新刷新;
-
-type MongoVoterImpl struct {
-	host      string
-	db        string
-	hbC       string
-	masterC   string
-	uuid      string
-	session   *mgo.Session
-	voterConf *core.VoterTimeConfig //选举需要使用到的超时配置
+type MongoBackend struct {
+	host          string
+	db            string
+	coll          string
+	socketTimeout time.Duration
+	session       *mgo.Session
+	group         *singleflight.Group
 }
 
-func NewMongoVoterImpl(host, db, hbC, masterC, uuid string, voterConf *core.VoterTimeConfig) (core.Voter, error) {
-	if db == "" || hbC == "" || masterC == "" || uuid == "" || host == "" || voterConf == nil {
+type mongoElement struct {
+	Key        string `json:"_id" bson:"_id"`               //lock name
+	OwnerId    string `json:"ownerId" bson:"ownerId"`       // owner
+	ExpireAt   int64  `json:"expireAt" bson:"expireAt"`     // 过期时间
+	UpdateTime int64  `json:"updateTime" bson:"updateTime"` // lock被更新的时间
+}
+
+func lockInfoToMongoElement(info *core.LockInfo) *mongoElement {
+	tmp := &mongoElement{
+		Key:     info.LockName,
+		OwnerId: info.OwnerId,
+	}
+
+	return tmp
+}
+
+func NewMongoBackend(host, db, coll string, socketTimeoutMs time.Duration) (core.LockBackend, error) {
+	if db == "" || coll == "" || host == "" {
 		return nil, core.ParamError
 	}
 
-	if err := voterConf.Check(); err != nil {
-		return nil, err
+	if socketTimeoutMs.Milliseconds() == 0 {
+		socketTimeoutMs = defaultSocketTimeout
 	}
 
-	tmp := &MongoVoterImpl{
-		host:      host,
-		db:        db,
-		masterC:   masterC,
-		hbC:       hbC,
-		uuid:      uuid,
-		voterConf: voterConf,
+	tmp := &MongoBackend{
+		host:          host,
+		db:            db,
+		coll:          coll,
+		socketTimeout: socketTimeoutMs,
+		group:         &singleflight.Group{},
 	}
 
 	sess, err := mgo.Dial(host)
 	if err != nil {
 		return nil, errors.New(fmt.Sprintf("mongo host init is error, err:%s", err.Error()))
 	}
+	sess.SetSocketTimeout(tmp.socketTimeout)
 	tmp.session = sess
+
 	return tmp, nil
 }
 
-func (m *MongoVoterImpl) Heartbeat() (bool, int64) {
-	now := time.Now().UnixMilli()
-	_, err := m.session.DB(m.db).C(m.hbC).Upsert(bson.M{"_id": m.uuid}, bson.M{
-		"_id":        m.uuid,
-		"updateTime": now,
-	})
-
-	if err != nil {
-		log.Printf("update heartbeat time is error: %s", err.Error())
-		return false, 0
+func (m *MongoBackend) Preemption(lock *core.LockInfo, timeoutMs time.Duration) (bool, int64, error) {
+	if lock == nil {
+		return false, 0, core.LockInfoParamsError
 	}
-	return true, now
+
+	if err := lock.Check(); err != nil {
+		return false, 0, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeoutMs)
+	defer cancel()
+
+	now := time.Now()
+
+	var resError error = nil
+	res := false
+	lockTime := int64(0)
+
+	completed := make(chan struct{})
+	defer close(completed)
+
+	go func() {
+		defer func() {
+			completed <- struct{}{}
+		}()
+
+		elem := lockInfoToMongoElement(lock)
+		elem.ExpireAt = now.UnixNano() + lock.LeaseMs*1000000
+		elem.UpdateTime = now.UnixMilli()
+
+		selectQuery := bson.M{
+			"_id": elem.Key,
+			"expireAt": bson.M{
+				"$lte": now.UnixNano() - lock.LeaseMs*1000000,
+			},
+		}
+		changeInfo, err := m.session.DB(m.db).C(m.coll).Upsert(selectQuery, elem)
+		if err != nil {
+			if mgo.IsDup(err) {
+				return
+			}
+
+			go func() {
+				m.group.Do("refresh", func() (interface{}, error) {
+					m.session.Refresh()
+					return nil, nil
+				})
+			}()
+			log.Printf("upsert error: %v", err)
+			resError = err
+			return
+		}
+		if changeInfo.Updated == 1 {
+			res = true
+			lockTime = now.UnixNano()
+			return
+		}
+		return
+	}()
+
+	select {
+	case <-ctx.Done():
+		{
+			log.Printf("preemption is timeout")
+			return false, 0, core.ServiceTimeoutError
+		}
+	case <-completed:
+		{
+			return res, lockTime, resError
+		}
+	}
 }
 
-func (m *MongoVoterImpl) GetVoterTimeConf() *core.VoterTimeConfig {
-	return m.voterConf
-}
+func (m *MongoBackend) UpdateLease(lock *core.LockInfo, timeoutMs time.Duration) (bool, int64, error) {
+	if lock == nil {
+		return false, 0, core.LockInfoParamsError
+	}
 
-func (m *MongoVoterImpl) GetMasterInfo() (*core.NodeStatus, error) {
-	item := &core.NodeStatus{}
-	err := m.session.DB(m.db).C(m.masterC).Find(bson.M{"_id": "master"}).One(item)
+	if err := lock.Check(); err != nil {
+		return false, 0, err
+	}
+
+	elem := lockInfoToMongoElement(lock)
+	now := time.Now()
+	elem.ExpireAt = now.UnixNano() + lock.LeaseMs*1000000
+	elem.UpdateTime = now.UnixMilli()
+
+	selectQuery := bson.M{
+		"_id":     elem.Key,
+		"ownerId": elem.OwnerId,
+		"expireAt": bson.M{
+			"$gt": now.UnixNano() - lock.LeaseMs*1000000,
+		},
+	}
+
+	changeInfo, err := m.session.DB(m.db).C(m.coll).Upsert(selectQuery, elem)
 	if err != nil {
+		if mgo.IsDup(err) {
+			return false, 0, nil
+		}
+		go func() {
+			m.group.Do("refresh", func() (interface{}, error) {
+				m.session.Refresh()
+				return nil, nil
+			})
+		}()
+		log.Printf("updateLease error: %v", err)
+		return false, 0, err
+	}
+
+	if changeInfo.Updated == 1 {
+		return true, now.UnixNano(), nil
+	}
+	return false, 0, nil
+
+}
+
+func (m *MongoBackend) Release(lock *core.LockInfo, timeoutMs time.Duration) (bool, error) {
+	if lock == nil {
+		return false, core.LockInfoParamsError
+	}
+
+	if err := lock.Check(); err != nil {
+		return false, err
+	}
+	now := time.Now()
+
+	selectQuery := bson.M{
+		"_id":     lock.LockName,
+		"ownerId": lock.OwnerId,
+		"expireAt": bson.M{
+			"$gt": now.UnixNano() - lock.LeaseMs*1000000,
+		},
+	}
+
+	err := m.session.DB(m.db).C(m.coll).Remove(selectQuery)
+	if err != nil {
+		go func() {
+			m.group.Do("refresh", func() (interface{}, error) {
+				m.session.Refresh()
+				return nil, nil
+			})
+		}()
+		log.Printf("delete error: %v", err)
+		return false, err
+	}
+	return true, nil
+}
+
+func (m *MongoBackend) QueryLockInfo(lock *core.LockInfo, timeoutMs time.Duration) (*core.LockInfo, error) {
+	if lock == nil {
+		return nil, core.LockInfoParamsError
+	}
+
+	if err := lock.Check(); err != nil {
 		return nil, err
 	}
 
-	return item, nil
-}
-
-func (m *MongoVoterImpl) ElectMaster(master string) (*core.NodeStatus, error) {
-	now := time.Now().UnixMilli()
-
-	filter := bson.M{"_id": "master"}
-	if master != "" {
-		filter["master"] = master
+	query := bson.M{
+		"_id":     lock.LockName,
+		"ownerId": lock.OwnerId,
 	}
 
-	info, err := m.session.DB(m.db).C(m.hbC).Upsert(filter, bson.M{
-		"_id":        "master",
-		"updateTime": now,
-		"master":     m.uuid,
-	})
-
+	info := core.LockInfo{}
+	err := m.session.DB(m.db).C(m.coll).Find(query).One(&info)
 	if err != nil {
+		if strings.Contains(err.Error(), mgo.ErrNotFound.Error()) {
+			return nil, nil
+		}
+		go func() {
+			m.group.Do("refresh", func() (interface{}, error) {
+				m.session.Refresh()
+				return nil, nil
+			})
+		}()
+		log.Printf("query error: %v", err)
 		return nil, err
 	}
-
-	if info.Updated > 0 {
-		log.Printf("master from %s ==> to %s", master, m.uuid)
-		return &core.NodeStatus{
-			Uuid:                m.uuid,
-			LatestHeartbeatTime: now,
-		}, nil
-	}
-	return m.GetMasterInfo()
+	return &info, nil
 }
 
-func (m *MongoVoterImpl) GetUuid() string {
-	return m.uuid
+func (m *MongoBackend) Close() error {
+	log.Printf("MongoBackend is close")
+	m.session.Close()
+	m.session = nil
+	return nil
 }
